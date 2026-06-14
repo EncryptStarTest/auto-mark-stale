@@ -206,12 +206,16 @@ jobs:
 
               echo "Marking stale: ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER} (last updated: ${UPDATED_AT})"
 
-              # Apply the stale label via REST
+              # Post a comment notifying the assignee(s)
               gh api \
                 --method POST \
                 -H "Accept: application/vnd.github+json" \
-                "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels" \
-                -f "labels[]=${STALE_LABEL}" > /dev/null
+                "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="👋 Hi ${ASSIGNEE_LOGINS} — this issue has been marked as **stale** because it has had no activity for ${STALE_DAYS} days.
+
+          If this issue is still relevant, please leave a comment or push an update to remove the \`${STALE_LABEL}\` label and keep it active.
+
+          This label was applied automatically by the roadmap stale-issue workflow." > /dev/null
 
               # Update the project Status field to the "Stale" option via GraphQL mutation.
               # This requires the project item's own node ID (ITEM_ID), not the issue ID.
@@ -230,16 +234,12 @@ jobs:
                 }
               " > /dev/null
 
-              # Post a comment notifying the assignee(s)
+              # Apply the stale label via REST
               gh api \
                 --method POST \
                 -H "Accept: application/vnd.github+json" \
-                "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="👋 Hi ${ASSIGNEE_LOGINS} — this issue has been marked as **stale** because it has had no activity for ${STALE_DAYS} days.
-
-          If this issue is still relevant, please leave a comment or push an update to remove the \`${STALE_LABEL}\` label and keep it active.
-
-          This label was applied automatically by the roadmap stale-issue workflow." > /dev/null
+                "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels" \
+                -f "labels[]=${STALE_LABEL}" > /dev/null
 
               MARKED_COUNT=$((MARKED_COUNT + 1))
             done
