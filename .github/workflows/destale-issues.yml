@@ -1,0 +1,190 @@
+name: Remove Stale Label on Activity
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  remove-stale:
+    name: Remove Stale Label on Activity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.STALE_BOT_APP_ID }}
+          private_key: ${{ secrets.STALE_BOT_PRIVATE_KEY }}
+
+      - name: Remove stale label from active issues via GraphQL
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          ORG_NAME: ${{ github.repository_owner }}
+          # Update with your organization's project number (the number in the project URL)
+          PROJECT_NUMBER: ${{ vars.ROADMAP_PROJECT_NUMBER }}
+          STALE_LABEL: stale
+        run: |
+          set -euo pipefail
+
+          echo "Checking for stale-labeled issues that have had recent activity..."
+
+          # ----------------------------------------------------------------
+          # Fetch all project items that carry the stale label.
+          # For each, we retrieve the label's createdAt so we can compare
+          # it against any comments made after the label was applied.
+          # ----------------------------------------------------------------
+          CURSOR=""
+          HAS_NEXT_PAGE=true
+          REMOVED_COUNT=0
+
+          while [ "$HAS_NEXT_PAGE" = "true" ]; do
+
+            if [ -z "$CURSOR" ]; then
+              AFTER_ARG="null"
+            else
+              AFTER_ARG="\"${CURSOR}\""
+            fi
+
+            RESPONSE=$(gh api graphql -f query="
+              query(\$org: String!, \$projectNumber: Int!) {
+                organization(login: \$org) {
+                  projectV2(number: \$projectNumber) {
+                    items(first: 100, after: ${AFTER_ARG}) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        content {
+                          ... on Issue {
+                            number
+                            title
+                            url
+                            updatedAt
+                            state
+                            repository {
+                              name
+                              owner {
+                                login
+                              }
+                            }
+                            labels(first: 20) {
+                              nodes {
+                                name
+                              }
+                            }
+                            # Fetch the most recent comment to compare against stale label application
+                            comments(last: 1) {
+                              nodes {
+                                createdAt
+                                author {
+                                  login
+                                }
+                              }
+                            }
+                            # Fetch timeline events so we can find when the stale label was applied
+                            timelineItems(last: 50, itemTypes: [LABELED_EVENT]) {
+                              nodes {
+                                ... on LabeledEvent {
+                                  createdAt
+                                  label {
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            " -f org="${ORG_NAME}" -F projectNumber="${PROJECT_NUMBER}")
+
+            HAS_NEXT_PAGE=$(echo "$RESPONSE" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
+            CURSOR=$(echo "$RESPONSE" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor')
+
+            echo "$RESPONSE" | jq -c '
+              .data.organization.projectV2.items.nodes[]
+              | select(.content | type == "object")
+              | .content
+              | select(.state == "OPEN")
+            ' | while IFS= read -r issue; do
+
+              ISSUE_NUMBER=$(echo "$issue" | jq -r '.number')
+              REPO_OWNER=$(echo "$issue"   | jq -r '.repository.owner.login')
+              REPO_NAME=$(echo "$issue"    | jq -r '.repository.name')
+
+              # Skip issues that don't carry the stale label
+              IS_STALE=$(echo "$issue" | jq -r --arg label "$STALE_LABEL" \
+                '.labels.nodes[].name | select(. == $label)' | wc -l)
+              if [ "$IS_STALE" -eq 0 ]; then
+                continue
+              fi
+
+              # Find when the stale label was most recently applied
+              STALE_LABELED_AT=$(echo "$issue" | jq -r --arg label "$STALE_LABEL" '
+                .timelineItems.nodes
+                | map(select(.label.name == $label))
+                | sort_by(.createdAt)
+                | last
+                | .createdAt
+              ')
+
+              if [ -z "$STALE_LABELED_AT" ] || [ "$STALE_LABELED_AT" = "null" ]; then
+                echo "Could not determine when stale label was applied for ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER}, skipping."
+                continue
+              fi
+
+              # Check whether the most recent comment was posted AFTER the stale label was applied
+              LAST_COMMENT_AT=$(echo "$issue" | jq -r '.comments.nodes | last | .createdAt // empty')
+              LAST_COMMENT_AUTHOR=$(echo "$issue" | jq -r '.comments.nodes | last | .author.login // empty')
+
+              SHOULD_DESTALE=false
+
+              if [ -n "$LAST_COMMENT_AT" ] && [[ "$LAST_COMMENT_AT" > "$STALE_LABELED_AT" ]]; then
+                # There is a comment newer than when the stale label was applied.
+                # Ignore comments made by this bot (identified by the App's slug) to avoid
+                # the bot's own stale notification comment re-triggering de-staling.
+                BOT_SLUG="${{ github.actor }}"
+                if [ "$LAST_COMMENT_AUTHOR" != "$BOT_SLUG" ]; then
+                  SHOULD_DESTALE=true
+                  echo "New comment by ${LAST_COMMENT_AUTHOR} after stale label on ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER}"
+                fi
+              fi
+
+              # Also check if the issue's updatedAt is newer than the stale label
+              # (covers edits, label changes, or other non-comment activity)
+              UPDATED_AT=$(echo "$issue" | jq -r '.updatedAt')
+              if [[ "$UPDATED_AT" > "$STALE_LABELED_AT" ]]; then
+                SHOULD_DESTALE=true
+                echo "Issue updated after stale label on ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER}"
+              fi
+
+              if [ "$SHOULD_DESTALE" = "true" ]; then
+                echo "Removing stale label from ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER}"
+
+                # Remove the stale label
+                gh api \
+                  --method DELETE \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels/${STALE_LABEL}" > /dev/null
+
+                # Post a comment confirming the label was removed
+                gh api \
+                  --method POST \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
+                  -f body="✅ This issue has seen recent activity and has been **removed from stale status**. The \`${STALE_LABEL}\` label has been cleared." > /dev/null
+
+                REMOVED_COUNT=$((REMOVED_COUNT + 1))
+              fi
+
+            done
+
+          done
+
+          echo "Done. Removed stale label from ${REMOVED_COUNT} issue(s)."

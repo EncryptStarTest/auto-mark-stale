@@ -1,0 +1,158 @@
+name: Mark Stale Issues
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  mark-stale:
+    name: Mark Stale Issues
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.STALE_BOT_APP_ID }}
+          private_key: ${{ secrets.STALE_BOT_PRIVATE_KEY }}
+
+      - name: Mark stale issues via GraphQL
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          ORG_NAME: ${{ github.repository_owner }}
+          # Update with your organization's project number (the number in the project URL)
+          PROJECT_NUMBER: ${{ vars.ROADMAP_PROJECT_NUMBER }}
+          STALE_DAYS: 14
+          STALE_LABEL: stale
+        run: |
+          set -euo pipefail
+
+          STALE_THRESHOLD=$(date -u -d "${STALE_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Marking issues not updated since: ${STALE_THRESHOLD}"
+
+          # ----------------------------------------------------------------
+          # Fetch all project items via GraphQL with pagination.
+          # We request the fields we need to determine staleness in one query:
+          #   - issue number, title, url, updatedAt
+          #   - assignees (to filter only assigned issues)
+          #   - labels (to skip already-stale issues)
+          #   - the repository owner/name (to apply labels via REST)
+          # ----------------------------------------------------------------
+          CURSOR=""
+          HAS_NEXT_PAGE=true
+          MARKED_COUNT=0
+
+          while [ "$HAS_NEXT_PAGE" = "true" ]; do
+
+            if [ -z "$CURSOR" ]; then
+              AFTER_ARG="null"
+            else
+              AFTER_ARG="\"${CURSOR}\""
+            fi
+
+            RESPONSE=$(gh api graphql -f query="
+              query(\$org: String!, \$projectNumber: Int!) {
+                organization(login: \$org) {
+                  projectV2(number: \$projectNumber) {
+                    items(first: 100, after: ${AFTER_ARG}) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        content {
+                          ... on Issue {
+                            number
+                            title
+                            url
+                            updatedAt
+                            state
+                            repository {
+                              name
+                              owner {
+                                login
+                              }
+                            }
+                            assignees(first: 10) {
+                              nodes {
+                                login
+                              }
+                            }
+                            labels(first: 20) {
+                              nodes {
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            " -f org="${ORG_NAME}" -F projectNumber="${PROJECT_NUMBER}")
+
+            HAS_NEXT_PAGE=$(echo "$RESPONSE" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
+            CURSOR=$(echo "$RESPONSE" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor')
+
+            # Process each item in the current page
+            echo "$RESPONSE" | jq -c '
+              .data.organization.projectV2.items.nodes[]
+              | select(.content | type == "object")   # skip drafts / non-issues
+              | .content
+              | select(.state == "OPEN")
+            ' | while IFS= read -r issue; do
+
+              ISSUE_NUMBER=$(echo "$issue" | jq -r '.number')
+              UPDATED_AT=$(echo "$issue"   | jq -r '.updatedAt')
+              REPO_OWNER=$(echo "$issue"   | jq -r '.repository.owner.login')
+              REPO_NAME=$(echo "$issue"    | jq -r '.repository.name')
+              ASSIGNEE_COUNT=$(echo "$issue" | jq '.assignees.nodes | length')
+              ALREADY_STALE=$(echo "$issue" | jq -r --arg label "$STALE_LABEL" \
+                '.labels.nodes[].name | select(. == $label)' | wc -l)
+              ASSIGNEE_LOGINS=$(echo "$issue" | jq -r '.assignees.nodes[].login' \
+                | sed 's/^/@/' | paste -sd ', ')
+
+              # Skip if no assignee
+              if [ "$ASSIGNEE_COUNT" -eq 0 ]; then
+                continue
+              fi
+
+              # Skip if already marked stale
+              if [ "$ALREADY_STALE" -gt 0 ]; then
+                continue
+              fi
+
+              # Skip if updated within the threshold
+              if [[ "$UPDATED_AT" > "$STALE_THRESHOLD" ]]; then
+                continue
+              fi
+
+              echo "Marking stale: ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER} (last updated: ${UPDATED_AT})"
+
+              # Apply the stale label
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels" \
+                -f "labels[]=${STALE_LABEL}" > /dev/null
+
+              # Post a comment notifying the assignee(s)
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="👋 Hi ${ASSIGNEE_LOGINS} — this issue has been marked as **stale** because it has had no activity for ${STALE_DAYS} days.
+
+              If this issue is still relevant, please leave a comment or push an update to remove the \`${STALE_LABEL}\` label and keep it active.
+
+              This label was applied automatically by the roadmap stale-issue workflow." > /dev/null
+
+              MARKED_COUNT=$((MARKED_COUNT + 1))
+            done
+
+          done
+
+          echo "Done. Marked ${MARKED_COUNT} issue(s) as stale."
