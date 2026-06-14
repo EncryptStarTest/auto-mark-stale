@@ -24,7 +24,7 @@ jobs:
           ORG_NAME: ${{ github.repository_owner }}
           # Update with your organization's project number (the number in the project URL)
           PROJECT_NUMBER: ${{ vars.ROADMAP_PROJECT_NUMBER }}
-          STALE_DAYS: 14
+          STALE_DAYS: ${{ vars.STALE_THRESHOLD_DAYS }}
           STALE_LABEL: stale
         run: |
           set -euo pipefail
