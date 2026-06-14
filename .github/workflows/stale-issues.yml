@@ -24,6 +24,8 @@ jobs:
           ORG_NAME: ${{ github.repository_owner }}
           # Update with your organization's project number (the number in the project URL)
           PROJECT_NUMBER: ${{ vars.ROADMAP_PROJECT_NUMBER }}
+          # Must match the name of the status option in your project exactly (case-sensitive)
+          STALE_STATUS_OPTION: "Stale"
           STALE_DAYS: ${{ vars.STALE_THRESHOLD_DAYS }}
           STALE_LABEL: stale
         run: |
@@ -33,12 +35,78 @@ jobs:
           echo "Marking issues not updated since: ${STALE_THRESHOLD}"
 
           # ----------------------------------------------------------------
+          # Resolve project metadata once up front:
+          #   PROJECT_ID       — the project's global node ID, required by
+          #                      the updateProjectV2ItemFieldValue mutation
+          #   STATUS_FIELD_ID  — the node ID of the "Status" single-select field
+          #   STALE_OPTION_ID  — the ID of the "Stale" option within that field
+          #
+          # These IDs are stable and will not change between runs, so we only
+          # need to fetch them once per workflow execution.
+          # ----------------------------------------------------------------
+          PROJECT_META=$(gh api graphql -f query="
+            query(\$org: String!, \$projectNumber: Int!) {
+              organization(login: \$org) {
+                projectV2(number: \$projectNumber) {
+                  id
+                  fields(first: 50) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        options {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          " -f org="${ORG_NAME}" -F projectNumber="${PROJECT_NUMBER}")
+
+          PROJECT_ID=$(echo "$PROJECT_META" | jq -r '.data.organization.projectV2.id')
+
+          STATUS_FIELD_ID=$(echo "$PROJECT_META" | jq -r '
+            .data.organization.projectV2.fields.nodes[]
+            | select(.name == "Status")
+            | .id
+          ')
+
+          STALE_OPTION_ID=$(echo "$PROJECT_META" | jq -r \
+            --arg option "$STALE_STATUS_OPTION" '
+            .data.organization.projectV2.fields.nodes[]
+            | select(.name == "Status")
+            | .options[]
+            | select(.name == $option)
+            | .id
+          ')
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$STATUS_FIELD_ID" ] || [ -z "$STALE_OPTION_ID" ]; then
+            echo "ERROR: Could not resolve project metadata."
+            echo "  PROJECT_ID=${PROJECT_ID}"
+            echo "  STATUS_FIELD_ID=${STATUS_FIELD_ID}"
+            echo "  STALE_OPTION_ID=${STALE_OPTION_ID}"
+            echo "Check that the project number is correct and that a Status field"
+            echo "with a '${STALE_STATUS_OPTION}' option exists in the project."
+            exit 1
+          fi
+
+          echo "Resolved project metadata:"
+          echo "  PROJECT_ID=${PROJECT_ID}"
+          echo "  STATUS_FIELD_ID=${STATUS_FIELD_ID}"
+          echo "  STALE_OPTION_ID=${STALE_OPTION_ID}"
+
+          # ----------------------------------------------------------------
           # Fetch all project items via GraphQL with pagination.
           # We request the fields we need to determine staleness in one query:
           #   - issue number, title, url, updatedAt
           #   - assignees (to filter only assigned issues)
           #   - labels (to skip already-stale issues)
           #   - the repository owner/name (to apply labels via REST)
+          # We also request the project item's own node ID so we can pass it
+          # to the updateProjectV2ItemFieldValue mutation below.
           # ----------------------------------------------------------------
           CURSOR=""
           HAS_NEXT_PAGE=true
@@ -62,6 +130,7 @@ jobs:
                         endCursor
                       }
                       nodes {
+                        id
                         content {
                           ... on Issue {
                             number
@@ -97,13 +166,18 @@ jobs:
             HAS_NEXT_PAGE=$(echo "$RESPONSE" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
             CURSOR=$(echo "$RESPONSE" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor')
 
-            # Process each item in the current page
+            # Process each item in the current page.
+            # We pipe the full node (including the project item `id`) alongside
+            # the issue content so both are available inside the loop.
             echo "$RESPONSE" | jq -c '
               .data.organization.projectV2.items.nodes[]
               | select(.content | type == "object")   # skip drafts / non-issues
-              | .content
-              | select(.state == "OPEN")
-            ' | while IFS= read -r issue; do
+              | { itemId: .id, issue: .content }
+              | select(.issue.state == "OPEN")
+            ' | while IFS= read -r row; do
+
+              ITEM_ID=$(echo "$row"      | jq -r '.itemId')
+              issue=$(echo "$row"        | jq -c '.issue')
 
               ISSUE_NUMBER=$(echo "$issue" | jq -r '.number')
               UPDATED_AT=$(echo "$issue"   | jq -r '.updatedAt')
@@ -132,12 +206,29 @@ jobs:
 
               echo "Marking stale: ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER} (last updated: ${UPDATED_AT})"
 
-              # Apply the stale label
+              # Apply the stale label via REST
               gh api \
                 --method POST \
                 -H "Accept: application/vnd.github+json" \
                 "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels" \
                 -f "labels[]=${STALE_LABEL}" > /dev/null
+
+              # Update the project Status field to the "Stale" option via GraphQL mutation.
+              # This requires the project item's own node ID (ITEM_ID), not the issue ID.
+              gh api graphql -f query="
+                mutation {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: \"${PROJECT_ID}\"
+                    itemId: \"${ITEM_ID}\"
+                    fieldId: \"${STATUS_FIELD_ID}\"
+                    value: { singleSelectOptionId: \"${STALE_OPTION_ID}\" }
+                  }) {
+                    projectV2Item {
+                      id
+                    }
+                  }
+                }
+              " > /dev/null
 
               # Post a comment notifying the assignee(s)
               gh api \
@@ -146,9 +237,9 @@ jobs:
                 "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
                 -f body="👋 Hi ${ASSIGNEE_LOGINS} — this issue has been marked as **stale** because it has had no activity for ${STALE_DAYS} days.
 
-              If this issue is still relevant, please leave a comment or push an update to remove the \`${STALE_LABEL}\` label and keep it active.
+          If this issue is still relevant, please leave a comment or push an update to remove the \`${STALE_LABEL}\` label and keep it active.
 
-              This label was applied automatically by the roadmap stale-issue workflow." > /dev/null
+          This label was applied automatically by the roadmap stale-issue workflow." > /dev/null
 
               MARKED_COUNT=$((MARKED_COUNT + 1))
             done

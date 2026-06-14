@@ -31,9 +31,59 @@ jobs:
           echo "Checking for stale-labeled issues that have had recent activity..."
 
           # ----------------------------------------------------------------
+          # Resolve project metadata once up front:
+          #   PROJECT_ID       — the project's global node ID, required by
+          #                      the clearProjectV2ItemFieldValue mutation
+          #   STATUS_FIELD_ID  — the node ID of the "Status" single-select field
+          #
+          # Unlike stale-issues.yml we do not need the Stale option ID here
+          # because clearProjectV2ItemFieldValue resets the field entirely
+          # rather than setting it to a specific value.
+          # ----------------------------------------------------------------
+          PROJECT_META=$(gh api graphql -f query="
+            query(\$org: String!, \$projectNumber: Int!) {
+              organization(login: \$org) {
+                projectV2(number: \$projectNumber) {
+                  id
+                  fields(first: 50) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          " -f org="${ORG_NAME}" -F projectNumber="${PROJECT_NUMBER}")
+
+          PROJECT_ID=$(echo "$PROJECT_META" | jq -r '.data.organization.projectV2.id')
+
+          STATUS_FIELD_ID=$(echo "$PROJECT_META" | jq -r '
+            .data.organization.projectV2.fields.nodes[]
+            | select(.name == "Status")
+            | .id
+          ')
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$STATUS_FIELD_ID" ]; then
+            echo "ERROR: Could not resolve project metadata."
+            echo "  PROJECT_ID=${PROJECT_ID}"
+            echo "  STATUS_FIELD_ID=${STATUS_FIELD_ID}"
+            echo "Check that the project number is correct and that a Status field exists."
+            exit 1
+          fi
+
+          echo "Resolved project metadata:"
+          echo "  PROJECT_ID=${PROJECT_ID}"
+          echo "  STATUS_FIELD_ID=${STATUS_FIELD_ID}"
+
+          # ----------------------------------------------------------------
           # Fetch all project items that carry the stale label.
           # For each, we retrieve the label's createdAt so we can compare
           # it against any comments made after the label was applied.
+          # We also request the project item's own node ID so we can pass it
+          # to the clearProjectV2ItemFieldValue mutation below.
           # ----------------------------------------------------------------
           CURSOR=""
           HAS_NEXT_PAGE=true
@@ -57,6 +107,7 @@ jobs:
                         endCursor
                       }
                       nodes {
+                        id
                         content {
                           ... on Issue {
                             number
@@ -110,9 +161,12 @@ jobs:
             echo "$RESPONSE" | jq -c '
               .data.organization.projectV2.items.nodes[]
               | select(.content | type == "object")
-              | .content
-              | select(.state == "OPEN")
-            ' | while IFS= read -r issue; do
+              | { itemId: .id, issue: .content }
+              | select(.issue.state == "OPEN")
+            ' | while IFS= read -r row; do
+
+              ITEM_ID=$(echo "$row"   | jq -r '.itemId')
+              issue=$(echo "$row"     | jq -c '.issue')
 
               ISSUE_NUMBER=$(echo "$issue" | jq -r '.number')
               REPO_OWNER=$(echo "$issue"   | jq -r '.repository.owner.login')
@@ -165,20 +219,38 @@ jobs:
               fi
 
               if [ "$SHOULD_DESTALE" = "true" ]; then
-                echo "Removing stale label from ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER}"
+                echo "Removing stale label and clearing project status for ${REPO_OWNER}/${REPO_NAME}#${ISSUE_NUMBER}"
 
-                # Remove the stale label
+                # Remove the stale label via REST
                 gh api \
                   --method DELETE \
                   -H "Accept: application/vnd.github+json" \
                   "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels/${STALE_LABEL}" > /dev/null
+
+                # Clear the project Status field entirely via GraphQL mutation.
+                # We use clearProjectV2ItemFieldValue rather than setting a new option
+                # so the issue has no status and can be triaged back to the correct
+                # state by the team (e.g. "In Progress", "Backlog", etc.).
+                gh api graphql -f query="
+                  mutation {
+                    clearProjectV2ItemFieldValue(input: {
+                      projectId: \"${PROJECT_ID}\"
+                      itemId: \"${ITEM_ID}\"
+                      fieldId: \"${STATUS_FIELD_ID}\"
+                    }) {
+                      projectV2Item {
+                        id
+                      }
+                    }
+                  }
+                " > /dev/null
 
                 # Post a comment confirming the label was removed
                 gh api \
                   --method POST \
                   -H "Accept: application/vnd.github+json" \
                   "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
-                  -f body="✅ This issue has seen recent activity and has been **removed from stale status**. The \`${STALE_LABEL}\` label has been cleared." > /dev/null
+                  -f body="✅ This issue has seen recent activity and has been **removed from stale status**. The \`${STALE_LABEL}\` label has been cleared and the project status has been reset — please update the status to reflect the current state of this issue." > /dev/null
 
                 REMOVED_COUNT=$((REMOVED_COUNT + 1))
               fi
