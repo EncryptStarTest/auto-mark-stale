@@ -13,10 +13,11 @@ jobs:
     steps:
       - name: Generate GitHub App token
         id: generate-token
-        uses: tibdex/github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app_id: ${{ secrets.STALE_BOT_APP_ID }}
           private_key: ${{ secrets.STALE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
 
       - name: Mark stale issues via GraphQL
         env:
@@ -210,11 +211,7 @@ jobs:
                 --method POST \
                 -H "Accept: application/vnd.github+json" \
                 "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="👋 Hi ${ASSIGNEE_LOGINS} — this issue has been marked as **stale** because it has had no activity for ${STALE_DAYS} days.
-
-          If this issue is still relevant, please leave a comment or push an update to remove the \`${STALE_LABEL}\` label and keep it active.
-
-          This label was applied automatically by the roadmap stale-issue workflow." > /dev/null
+                -f body="👋 Hi ${ASSIGNEE_LOGINS} — this issue has been marked as **stale** because it has had no activity for ${STALE_DAYS} days." > /dev/null
 
               # Update the project Status field to the "Stale" option via GraphQL mutation.
               # This requires the project item's own node ID (ITEM_ID), not the issue ID.
