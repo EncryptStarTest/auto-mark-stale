@@ -110,7 +110,6 @@ jobs:
           # ----------------------------------------------------------------
           CURSOR=""
           HAS_NEXT_PAGE=true
-          MARKED_COUNT=0
 
           while [ "$HAS_NEXT_PAGE" = "true" ]; do
 
@@ -241,9 +240,8 @@ jobs:
                 "/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels" \
                 -f "labels[]=${STALE_LABEL}" > /dev/null
 
-              ((MARKED_COUNT=MARKED_COUNT+1))
             done
 
           done
 
-          echo "Done. Marked ${MARKED_COUNT} issue(s) as stale."
+          echo "Done."
